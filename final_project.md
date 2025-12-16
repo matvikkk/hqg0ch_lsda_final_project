@@ -387,19 +387,45 @@ from awsglue.context import GlueContext
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-args = getResolvedOptions(
-    sys.argv,
-    ["RAW_S3_PATH", "OUT_S3_PATH", "MAX_TZ_CALLS", "HOLIDAY_COUNTRY"]
-)
+args = getResolvedOptions(sys.argv, [
+    "RAW_S3_PATH",
+    "OUT_S3_PATH",
+    "HOLIDAY_YEAR",
+    "MAX_TZ_LOOKUPS"
+])
 
 raw_path = args["RAW_S3_PATH"]
 out_path = args["OUT_S3_PATH"]
-max_tz_calls = int(args["MAX_TZ_CALLS"])
-holiday_country = args["HOLIDAY_COUNTRY"]
+holiday_year = int(args["HOLIDAY_YEAR"])
+max_tz_lookups = int(args["MAX_TZ_LOOKUPS"])
 
 sc = SparkContext.getOrCreate()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
+
+def fetch_us_holidays(year: int):
+    url = f"https://date.nager.at/api/v3/publicholidays/{year}/US"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    m = {}
+    for item in data:
+        d = item.get("date")
+        name = item.get("name") or item.get("localName")
+        if d and name:
+            m[d] = name
+    return m
+
+def fetch_timezone(lat: float, lon: float):
+    q = urllib.parse.urlencode({"latitude": str(lat), "longitude": str(lon)})
+    url = f"https://timeapi.io/api/TimeZone/coordinate?{q}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    tz = data.get("timeZone") or data.get("timeZoneId") or data.get("time_zone")
+    return tz
+
+holiday_map = fetch_us_holidays(holiday_year)
 
 df = (
     spark.read.format("csv")
@@ -414,106 +440,50 @@ df = df.withColumn("trans_date", F.to_date(F.col("trans_ts")))
 df = df.withColumn("trans_year", F.year(F.col("trans_ts")))
 df = df.withColumn("trans_month", F.month(F.col("trans_ts")))
 
-df = df.withColumn("latitude_d", F.col("lat").cast("double"))
-df = df.withColumn("longitude_d", F.col("long").cast("double"))
-
-years = [r["y"] for r in df.select(F.col("trans_year").alias("y")).where(F.col("y").isNotNull()).distinct().collect()]
-
-def http_get_json(url: str, timeout_s: int = 10):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=timeout_s) as r:
-        return json.loads(r.read().decode("utf-8"))
-
-holiday_map = {}
-for y in years:
-    try:
-        url = f"https://date.nager.at/api/v3/publicholidays/{int(y)}/{holiday_country}"
-        data = http_get_json(url, timeout_s=20)
-        if isinstance(data, list):
-            for item in data:
-                d = item.get("date")
-                name = item.get("name") or item.get("localName")
-                if d and name:
-                    holiday_map[d] = str(name)
-    except Exception:
-        pass
-
-b_holiday_map = sc.broadcast(holiday_map)
-
-tz_schema = T.StructType([
-    T.StructField("lat", T.DoubleType(), True),
-    T.StructField("lon", T.DoubleType(), True),
-    T.StructField("timezone_api", T.StringType(), True),
-    T.StructField("utc_offset", T.StringType(), True)
-])
-
-def timeapi_timezone(lat: float, lon: float):
-    try:
-        qs = urllib.parse.urlencode({"latitude": lat, "longitude": lon})
-        url = f"https://timeapi.io/api/TimeZone/coordinate?{qs}"
-        data = http_get_json(url, timeout_s=10)
-        tz = data.get("timeZone") if isinstance(data, dict) else None
-        off = data.get("utcOffset") if isinstance(data, dict) else None
-        return (tz, off)
-    except Exception:
-        return (None, None)
-
-def tz_partition(rows):
-    cache = {}
-    calls = 0
-    for row in rows:
-        lat = row["lat"]
-        lon = row["lon"]
-        if lat is None or lon is None:
-            yield (lat, lon, None, None)
-            continue
-        key = (round(float(lat), 5), round(float(lon), 5))
-        if key in cache:
-            tz, off = cache[key]
-            yield (lat, lon, tz, off)
-            continue
-        if max_tz_calls > 0 and calls >= max_tz_calls:
-            yield (lat, lon, None, None)
-            continue
-        tz, off = timeapi_timezone(key[0], key[1])
-        cache[key] = (tz, off)
-        calls += 1
-        yield (lat, lon, tz, off)
-
-coords = (
-    df.select(F.col("latitude_d").alias("lat"), F.col("longitude_d").alias("lon"))
-      .where(F.col("lat").isNotNull() & F.col("lon").isNotNull())
-      .dropDuplicates()
-)
-
-tz_rdd = coords.rdd.mapPartitions(tz_partition)
-tz_df = spark.createDataFrame(tz_rdd, schema=tz_schema)
-
-df = df.join(
-    tz_df,
-    (df.latitude_d == tz_df.lat) & (df.longitude_d == tz_df.lon),
-    "left"
-).drop("lat", "lon")
-
-@F.udf(returnType=T.StringType())
-def holiday_name_udf(d):
-    if d is None:
-        return None
-    return b_holiday_map.value.get(str(d), None)
-
-df = df.withColumn("holiday_name", holiday_name_udf(F.date_format(F.col("trans_date"), "yyyy-MM-dd")))
+holiday_map_expr = F.create_map([F.lit(x) for kv in holiday_map.items() for x in kv])
+df = df.withColumn("holiday_key", F.date_format(F.col("trans_date"), "yyyy-MM-dd"))
+df = df.withColumn("holiday_name", holiday_map_expr.getItem(F.col("holiday_key")))
 df = df.withColumn("is_holiday", F.when(F.col("holiday_name").isNotNull(), F.lit(1)).otherwise(F.lit(0)))
 
-df = df.withColumn("local_hour", F.hour(F.col("trans_ts")))
-df = df.withColumn(
-    "is_night_transaction",
-    F.when((F.col("local_hour") >= 0) & (F.col("local_hour") <= 5), F.lit(1)).otherwise(F.lit(0))
+df = df.withColumn("lat_d", F.col("lat").cast("double"))
+df = df.withColumn("long_d", F.col("long").cast("double"))
+
+coords = (
+    df.select("lat_d", "long_d")
+      .where(F.col("lat_d").isNotNull() & F.col("long_d").isNotNull())
+      .dropDuplicates()
+      .limit(max_tz_lookups)
+      .collect()
 )
+
+tz_rows = []
+for row in coords:
+    lat = float(row["lat_d"])
+    lon = float(row["long_d"])
+    try:
+        tz = fetch_timezone(lat, lon)
+    except Exception:
+        tz = None
+    if tz:
+        tz_rows.append((lat, lon, tz))
+
+tz_schema = T.StructType([
+    T.StructField("lat_d", T.DoubleType(), False),
+    T.StructField("long_d", T.DoubleType(), False),
+    T.StructField("timezone", T.StringType(), True)
+])
+
+tz_df = spark.createDataFrame(tz_rows, schema=tz_schema) if len(tz_rows) > 0 else spark.createDataFrame([], tz_schema)
+
+df = df.join(tz_df, on=["lat_d", "long_d"], how="left")
+
+df = df.withColumn("local_hour", F.hour(F.col("trans_ts")))
+df = df.withColumn("is_night_transaction", F.when((F.col("local_hour") >= 0) & (F.col("local_hour") <= 5), F.lit(1)).otherwise(F.lit(0)))
 
 df = df.withColumn("sanctions_hit_merchant", F.lit(None).cast(T.IntegerType()))
 df = df.withColumn("sanctions_hit_customer", F.lit(None).cast(T.IntegerType()))
 
-df_out = df.drop("trans_ts")
+df_out = df.drop("trans_ts", "holiday_key")
 
 (
     df_out.write.mode("overwrite")

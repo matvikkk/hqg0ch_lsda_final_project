@@ -378,20 +378,28 @@ Below is the core AWS Glue (PySpark) script used for this enrichment process:
 
 ```python
 import sys
+import json
+import urllib.request
+import urllib.parse
 from awsglue.utils import getResolvedOptions
 from pyspark.context import SparkContext
 from awsglue.context import GlueContext
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-args = getResolvedOptions(sys.argv, ["RAW_S3_PATH", "OUT_S3_PATH"])
+args = getResolvedOptions(
+    sys.argv,
+    ["RAW_S3_PATH", "OUT_S3_PATH", "MAX_TZ_CALLS", "HOLIDAY_COUNTRY"]
+)
+
+raw_path = args["RAW_S3_PATH"]
+out_path = args["OUT_S3_PATH"]
+max_tz_calls = int(args["MAX_TZ_CALLS"])
+holiday_country = args["HOLIDAY_COUNTRY"]
 
 sc = SparkContext.getOrCreate()
 glueContext = GlueContext(sc)
 spark = glueContext.spark_session
-
-raw_path = args["RAW_S3_PATH"]
-out_path = args["OUT_S3_PATH"]
 
 df = (
     spark.read.format("csv")
@@ -406,42 +414,101 @@ df = df.withColumn("trans_date", F.to_date(F.col("trans_ts")))
 df = df.withColumn("trans_year", F.year(F.col("trans_ts")))
 df = df.withColumn("trans_month", F.month(F.col("trans_ts")))
 
-state_tz = {
-    "AL":"America/Chicago","AK":"America/Anchorage","AZ":"America/Phoenix","AR":"America/Chicago",
-    "CA":"America/Los_Angeles","CO":"America/Denver","CT":"America/New_York","DE":"America/New_York",
-    "FL":"America/New_York","GA":"America/New_York","HI":"Pacific/Honolulu","ID":"America/Denver",
-    "IL":"America/Chicago","IN":"America/Indiana/Indianapolis","IA":"America/Chicago","KS":"America/Chicago",
-    "KY":"America/New_York","LA":"America/Chicago","ME":"America/New_York","MD":"America/New_York",
-    "MA":"America/New_York","MI":"America/Detroit","MN":"America/Chicago","MS":"America/Chicago",
-    "MO":"America/Chicago","MT":"America/Denver","NE":"America/Chicago","NV":"America/Los_Angeles",
-    "NH":"America/New_York","NJ":"America/New_York","NM":"America/Denver","NY":"America/New_York",
-    "NC":"America/New_York","ND":"America/Chicago","OH":"America/New_York","OK":"America/Chicago",
-    "OR":"America/Los_Angeles","PA":"America/New_York","RI":"America/New_York","SC":"America/New_York",
-    "SD":"America/Chicago","TN":"America/Chicago","TX":"America/Chicago","UT":"America/Denver",
-    "VT":"America/New_York","VA":"America/New_York","WA":"America/Los_Angeles","WV":"America/New_York",
-    "WI":"America/Chicago","WY":"America/Denver","DC":"America/New_York"
-}
+df = df.withColumn("latitude_d", F.col("lat").cast("double"))
+df = df.withColumn("longitude_d", F.col("long").cast("double"))
 
-tz_map_expr = F.create_map([F.lit(x) for kv in state_tz.items() for x in kv])
-df = df.withColumn("timezone", tz_map_expr.getItem(F.col("state")))
-df = df.withColumn("local_hour", F.hour(F.col("trans_ts")))
-df = df.withColumn("is_night_transaction", F.when((F.col("local_hour") >= 0) & (F.col("local_hour") <= 5), F.lit(1)).otherwise(F.lit(0)))
+years = [r["y"] for r in df.select(F.col("trans_year").alias("y")).where(F.col("y").isNotNull()).distinct().collect()]
 
-holiday_map = {
-    "2019-01-01":"New Year’s Day","2019-01-21":"Martin Luther King, Jr. Day","2019-02-18":"Presidents’ Day",
-    "2019-05-27":"Memorial Day","2019-07-04":"Independence Day","2019-09-02":"Labor Day",
-    "2019-10-14":"Columbus Day","2019-11-11":"Veterans Day","2019-11-28":"Thanksgiving Day","2019-12-25":"Christmas Day",
-    "2020-01-01":"New Year’s Day","2020-01-20":"Martin Luther King, Jr. Day","2020-02-17":"Presidents’ Day",
-    "2020-05-25":"Memorial Day","2020-07-04":"Independence Day","2020-09-07":"Labor Day",
-    "2020-10-12":"Columbus Day","2020-11-11":"Veterans Day","2020-11-26":"Thanksgiving Day","2020-12-25":"Christmas Day",
-    "2021-01-01":"New Year’s Day","2021-01-18":"Martin Luther King, Jr. Day","2021-02-15":"Presidents’ Day",
-    "2021-05-31":"Memorial Day","2021-07-04":"Independence Day","2021-09-06":"Labor Day",
-    "2021-10-11":"Columbus Day","2021-11-11":"Veterans Day","2021-11-25":"Thanksgiving Day","2021-12-25":"Christmas Day"
-}
+def http_get_json(url: str, timeout_s: int = 10):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout_s) as r:
+        return json.loads(r.read().decode("utf-8"))
 
-holiday_map_expr = F.create_map([F.lit(x) for kv in holiday_map.items() for x in kv])
-df = df.withColumn("holiday_name", holiday_map_expr.getItem(F.date_format(F.col("trans_date"), "yyyy-MM-dd")))
+holiday_map = {}
+for y in years:
+    try:
+        url = f"https://date.nager.at/api/v3/publicholidays/{int(y)}/{holiday_country}"
+        data = http_get_json(url, timeout_s=20)
+        if isinstance(data, list):
+            for item in data:
+                d = item.get("date")
+                name = item.get("name") or item.get("localName")
+                if d and name:
+                    holiday_map[d] = str(name)
+    except Exception:
+        pass
+
+b_holiday_map = sc.broadcast(holiday_map)
+
+tz_schema = T.StructType([
+    T.StructField("lat", T.DoubleType(), True),
+    T.StructField("lon", T.DoubleType(), True),
+    T.StructField("timezone_api", T.StringType(), True),
+    T.StructField("utc_offset", T.StringType(), True)
+])
+
+def timeapi_timezone(lat: float, lon: float):
+    try:
+        qs = urllib.parse.urlencode({"latitude": lat, "longitude": lon})
+        url = f"https://timeapi.io/api/TimeZone/coordinate?{qs}"
+        data = http_get_json(url, timeout_s=10)
+        tz = data.get("timeZone") if isinstance(data, dict) else None
+        off = data.get("utcOffset") if isinstance(data, dict) else None
+        return (tz, off)
+    except Exception:
+        return (None, None)
+
+def tz_partition(rows):
+    cache = {}
+    calls = 0
+    for row in rows:
+        lat = row["lat"]
+        lon = row["lon"]
+        if lat is None or lon is None:
+            yield (lat, lon, None, None)
+            continue
+        key = (round(float(lat), 5), round(float(lon), 5))
+        if key in cache:
+            tz, off = cache[key]
+            yield (lat, lon, tz, off)
+            continue
+        if max_tz_calls > 0 and calls >= max_tz_calls:
+            yield (lat, lon, None, None)
+            continue
+        tz, off = timeapi_timezone(key[0], key[1])
+        cache[key] = (tz, off)
+        calls += 1
+        yield (lat, lon, tz, off)
+
+coords = (
+    df.select(F.col("latitude_d").alias("lat"), F.col("longitude_d").alias("lon"))
+      .where(F.col("lat").isNotNull() & F.col("lon").isNotNull())
+      .dropDuplicates()
+)
+
+tz_rdd = coords.rdd.mapPartitions(tz_partition)
+tz_df = spark.createDataFrame(tz_rdd, schema=tz_schema)
+
+df = df.join(
+    tz_df,
+    (df.latitude_d == tz_df.lat) & (df.longitude_d == tz_df.lon),
+    "left"
+).drop("lat", "lon")
+
+@F.udf(returnType=T.StringType())
+def holiday_name_udf(d):
+    if d is None:
+        return None
+    return b_holiday_map.value.get(str(d), None)
+
+df = df.withColumn("holiday_name", holiday_name_udf(F.date_format(F.col("trans_date"), "yyyy-MM-dd")))
 df = df.withColumn("is_holiday", F.when(F.col("holiday_name").isNotNull(), F.lit(1)).otherwise(F.lit(0)))
+
+df = df.withColumn("local_hour", F.hour(F.col("trans_ts")))
+df = df.withColumn(
+    "is_night_transaction",
+    F.when((F.col("local_hour") >= 0) & (F.col("local_hour") <= 5), F.lit(1)).otherwise(F.lit(0))
+)
 
 df = df.withColumn("sanctions_hit_merchant", F.lit(None).cast(T.IntegerType()))
 df = df.withColumn("sanctions_hit_customer", F.lit(None).cast(T.IntegerType()))
